@@ -295,6 +295,9 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
         "strike_source": strike_source,   # "chainlink_ws" (matches Polymarket) or "binance_open" (fallback)
         "open_reason": decision.get("reason", "entry"),  # "ev_enter" (EV signal) or "flip_entry" (flip)
         "end_ts": end_ts,
+        # Window this trade belongs to (aligned 15m boundary) — lets a flip-closed
+        # trade be scored against the market's true open/close after the window ends.
+        "window_start_ms": int(end_ts * 1000) - settings.CANDLE_WINDOW_MINUTES * 60_000,
         "mode": state["trading_mode"]
     }
 
@@ -389,6 +392,12 @@ async def maybe_flip_position(fair_up: Optional[float], poly_snapshot: Dict[str,
     trade["exit_reason"] = "flip"
     trade["settlement_price_at_expiry"] = exit_price
     trade["profit_loss"] = (trade["shares"] * exit_price) - trade["amount"]
+    # The realized P/L above is the early-exit sell. Record the market OPEN now; the
+    # CLOSE + whether this side actually won gets backfilled once the window ends
+    # (see the backfill pass in update_loop). This is why a flip can book a loss even
+    # though the market later resolves in this side's favour.
+    trade["open_price"] = trade.get("strike_price")
+    trade["exit_mark"] = exit_price  # price we sold out at (not the market close)
     state["trade_history"].append(trade)
     state["active_trades"] = [t for t in state["active_trades"] if t is not trade]
     state["last_trade_side"] = None
@@ -430,6 +439,15 @@ async def update_trades(current_prices: Dict[str, Any]):
                 end_ts = now_ts
         expired = now_ts >= end_ts
 
+        # Freeze the CLOSE price the instant the window ends. Polymarket settles on the
+        # Chainlink value AT the close time — not whenever we happen to resolve (which
+        # can lag 15s+ behind). Capturing it once here stops post-expiry price drift
+        # from flipping a near-the-money win/loss.
+        if expired and trade.get("close_price") is None:
+            frozen_close = cur_price or trade.get("last_price")
+            if frozen_close:
+                trade["close_price"] = frozen_close
+
         # Always poll the market (throttled ~15s) so we can read the AUTHORITATIVE
         # Polymarket resolution even after the local clock says the window expired.
         market = None
@@ -463,22 +481,28 @@ async def update_trades(current_prices: Dict[str, Any]):
         down_index = next((i for i, x in enumerate(outcomes) if x.lower() == settings.POLYMARKET_DOWN_LABEL.lower()), 1)
 
         winning_index = -1
+        resolution = None
         # 1) Authoritative: a settled Polymarket outcome trades at ~$1.
         for i, p in enumerate(outcome_prices):
             try:
                 if float(p) > 0.9:
                     winning_index = i
+                    resolution = "polymarket_settled"
                     break
             except Exception:
                 pass
 
-        # 2) Fallback once the window/market is over: settlement price vs strike.
-        settlement_price = trade.get("settlement_price_at_expiry") or trade.get("last_price") or cur_price
+        # 2) Fallback once the window/market is over: frozen CLOSE vs STRIKE (open).
+        # Both are Chainlink (Polymarket WS) values, so this mirrors how Polymarket
+        # resolves: did the close finish above or below the open?
+        strike = trade.get("strike_price")  # the marked OPEN
+        settlement_price = (trade.get("close_price") or trade.get("settlement_price_at_expiry")
+                            or trade.get("last_price") or cur_price)  # the frozen CLOSE
         if winning_index == -1 and (expired or market_closed):
-            strike = trade.get("strike_price")
             if strike and settlement_price:
                 trade["settlement_price_at_expiry"] = settlement_price
                 winning_index = up_index if settlement_price > strike else down_index
+                resolution = "close_vs_open"
 
         # ---- Could not resolve yet ----
         if winning_index == -1:
@@ -506,6 +530,19 @@ async def update_trades(current_prices: Dict[str, Any]):
         won = ((trade["side"] == "UP" and winning_index == up_index) or
                (trade["side"] == "DOWN" and winning_index == down_index))
 
+        # Open/close context — record it and show it in the log so the direction
+        # (and which side that made win) is always visible.
+        open_px = strike
+        close_px = trade.get("close_price") or settlement_price
+        trade["open_price"] = open_px
+        trade["close_price"] = close_px
+        trade["resolution"] = resolution or "unknown"
+        if open_px and close_px:
+            move_side = "UP" if close_px > open_px else "DOWN"
+            dir_txt = f"open {open_px:.2f} -> close {close_px:.2f} ({move_side} by {abs(close_px - open_px):.2f})"
+        else:
+            dir_txt = f"open {open_px} -> close {close_px}"
+
         if won:
             payout = trade["shares"] * 1.0
             # Paper credits the simulated balance; live balance comes from the
@@ -513,10 +550,12 @@ async def update_trades(current_prices: Dict[str, Any]):
             if trade.get("mode", "paper") == "paper":
                 state["paper_balance"] += payout
             trade["profit_loss"] = payout - trade["amount"]
-            log_message(f"WIN: Trade for {trade['market_slug']} settled. Profit: ${trade['profit_loss']:.2f}")
+            result = "WIN"
         else:
             trade["profit_loss"] = -trade["amount"]
-            log_message(f"LOSS: Trade for {trade['market_slug']} settled. Loss: ${trade['profit_loss']:.2f}")
+            result = "LOSS"
+
+        log_message(f"{result} [{resolution or 'unknown'}] {trade['side']}: {dir_txt} -> P/L ${trade['profit_loss']:.2f} ({trade['market_slug']})")
 
         trade["status"] = "CLOSED"
         trade["exit_reason"] = "settled"
@@ -627,11 +666,20 @@ async def update_loop():
             start_ms = timing["startMs"]
             window_ms = settings.CANDLE_WINDOW_MINUTES * 60_000
             opens = state["market_opens"]
+            prev_ws = state.get("last_window_start")
+            # When the window rolls over, freeze the PRIOR window's CLOSE = the last
+            # Chainlink price we saw in it. This gives every trade in that window
+            # (including flip-closed ones) a true market close to be scored against.
+            if prev_ws is not None and prev_ws != start_ms and prev_ws in opens:
+                if opens[prev_ws].get("close") is None and state.get("last_seen_price"):
+                    opens[prev_ws]["close"] = state["last_seen_price"]
+            if current_price:
+                state["last_seen_price"] = current_price
             # "genuine" == we were already running in the immediately-preceding
             # window, so the first price we see in this one really is its open.
-            observed_prev = state.get("last_window_start") == start_ms - window_ms
+            observed_prev = prev_ws == start_ms - window_ms
             if start_ms not in opens:
-                opens[start_ms] = {"chainlink": None, "binance": None, "genuine": observed_prev}
+                opens[start_ms] = {"chainlink": None, "binance": None, "close": None, "genuine": observed_prev}
                 for k in list(opens.keys()):           # prune old windows
                     if k < start_ms - 4 * window_ms:
                         del opens[k]
@@ -708,6 +756,26 @@ async def update_loop():
                 t["unrealized_pl"] = (t["shares"] * mark) - t["amount"]
                 open_value += t["shares"] * mark
             equity = state["paper_balance"] + open_value
+
+            # ── Backfill the market OUTCOME onto flip-closed trades ──────────────
+            # A flip books its P/L on the early-exit sell, so a side can show a loss
+            # even though the market later resolves in its favour. Once that window's
+            # CLOSE is known, score each flipped-out side against the true open→close
+            # so the history shows whether the market actually went its way.
+            backfilled = False
+            for h in state["trade_history"]:
+                if h.get("exit_reason") != "flip" or h.get("market_won") is not None:
+                    continue
+                ws = h.get("window_start_ms")
+                winfo = opens.get(ws) if ws is not None else None
+                close_px = winfo.get("close") if winfo else None
+                open_px = h.get("open_price") or h.get("strike_price")
+                if close_px is not None and open_px:
+                    h["close_price"] = close_px
+                    h["market_won"] = (("UP" if close_px > open_px else "DOWN") == h["side"])
+                    backfilled = True
+            if backfilled:
+                save_state()
 
             # In live mode, reflect the real on-chain USDC balance in the dashboard
             if state["trading_mode"] == "live":

@@ -209,6 +209,7 @@
                                     <th class="px-4 py-2">Entry</th>
                                     <th class="px-4 py-2">Opened by</th>
                                     <th class="px-4 py-2">Exit</th>
+                                    <th class="px-4 py-2">Open→Close</th>
                                     <th class="px-4 py-2">P/L</th>
                                     <th class="px-4 py-2 text-right">Settled</th>
                                 </tr>
@@ -222,13 +223,16 @@
                                         <td class="px-4 py-3 font-mono font-bold" :class="trade.open_reason === 'flip_entry' ? 'text-orange-400' : 'text-blue-400'" x-text="trade.open_reason === 'flip_entry' ? 'FLIP' : 'EV'"></td>
                                         <td class="px-4 py-3 font-mono font-bold"
                                             :class="trade.exit_reason === 'flip' ? 'text-orange-400' : ((trade.status === 'VOID' || trade.exit_reason === 'void') ? 'text-gray-500' : 'text-teal-400')"
-                                            x-text="trade.exit_reason ? trade.exit_reason.toUpperCase() : (trade.status === 'VOID' ? 'VOID' : 'SETTLED')"></td>
+                                            x-text="(trade.exit_reason ? trade.exit_reason.toUpperCase() : (trade.status === 'VOID' ? 'VOID' : 'SETTLED')) + (trade.exit_reason === 'flip' && trade.market_won != null ? (trade.market_won ? ' ✓won' : ' ✗lost') : '')"></td>
+                                        <td class="px-4 py-3 font-mono text-[10px]"
+                                            :class="(trade.open_price != null && trade.close_price != null) ? (trade.close_price >= trade.open_price ? 'text-green-400' : 'text-red-400') : 'text-gray-500'"
+                                            x-text="(trade.open_price != null && trade.close_price != null) ? (Math.round(trade.open_price).toLocaleString() + '→' + Math.round(trade.close_price).toLocaleString() + (trade.close_price >= trade.open_price ? ' ↑' : ' ↓')) : '—'"></td>
                                         <td class="px-4 py-3 font-bold font-mono" :class="trade.profit_loss > 0 ? 'text-green-400' : 'text-red-400'" x-text="(trade.profit_loss > 0 ? '+$' : '-$') + Math.abs(trade.profit_loss).toFixed(2)"></td>
                                         <td class="px-4 py-3 text-right text-gray-500" x-text="new Date(trade.exit_time).toLocaleTimeString()"></td>
                                     </tr>
                                 </template>
                                 <tr x-show="!tradeHistory.length">
-                                    <td colspan="7" class="py-6 text-center text-gray-600 italic text-xs">No closed trades yet.</td>
+                                    <td colspan="8" class="py-6 text-center text-gray-600 italic text-xs">No closed trades yet.</td>
                                 </tr>
                             </tbody>
                         </table>
