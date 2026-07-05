@@ -293,6 +293,7 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
         "profit_loss": None,
         "strike_price": target_open,
         "strike_source": strike_source,   # "chainlink_ws" (matches Polymarket) or "binance_open" (fallback)
+        "open_reason": decision.get("reason", "entry"),  # "ev_enter" (EV signal) or "flip_entry" (flip)
         "end_ts": end_ts,
         "mode": state["trading_mode"]
     }
@@ -303,7 +304,8 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
         state["last_trade_side"] = side
         save_state()
 
-        log_message(f"Executed PAPER trade: {side} @ {price} for {market.get('slug')} (Amount: ${amount_to_risk:.2f})")
+        open_why = "FLIP" if decision.get("reason") == "flip_entry" else "EV signal"
+        log_message(f"Executed PAPER trade [{open_why}]: {side} @ {price} for {market.get('slug')} (Amount: ${amount_to_risk:.2f})")
         return "entered"
     else:
         # LIVE: place a real Fill-Or-Kill market BUY on the Polymarket CLOB
@@ -323,7 +325,8 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
             state["active_trades"].append(trade)
             state["last_trade_side"] = side
             save_state()
-            log_message(f"Executed LIVE trade: {side} ${amount_to_risk:.2f} on {market.get('slug')} (order {order_id})")
+            open_why = "FLIP" if decision.get("reason") == "flip_entry" else "EV signal"
+            log_message(f"Executed LIVE trade [{open_why}]: {side} ${amount_to_risk:.2f} on {market.get('slug')} (order {order_id})")
             return "entered"
         else:
             log_message(f"LIVE trade FAILED ({side}): {result.get('error')}")
@@ -397,6 +400,7 @@ async def maybe_flip_position(fair_up: Optional[float], poly_snapshot: Dict[str,
     flip_decision = {"action": "ENTER", "side": new_side, "phase": "FLIP", "strength": "FLIP",
                      "prob": new_prob, "reason": "flip_entry"}
     await execute_trade(flip_decision, prices, market, strike_open, token_ids, orderbook, strike_source)
+    return new_side  # signal to the loop that a flip happened this tick
 
 async def update_trades(current_prices: Dict[str, Any]):
     remaining_active = []
@@ -488,6 +492,7 @@ async def update_trades(current_prices: Dict[str, Any]):
                 continue
             # Grace exhausted — void so a single bad trade can't block forever.
             trade["status"] = "VOID"
+            trade["exit_reason"] = "void"
             trade["exit_time"] = datetime.now().isoformat()
             trade["profit_loss"] = 0.0
             if trade.get("mode", "paper") == "paper":
@@ -514,6 +519,7 @@ async def update_trades(current_prices: Dict[str, Any]):
             log_message(f"LOSS: Trade for {trade['market_slug']} settled. Loss: ${trade['profit_loss']:.2f}")
 
         trade["status"] = "CLOSED"
+        trade["exit_reason"] = "settled"
         trade["exit_time"] = datetime.now().isoformat()
         trade["settlement_price_at_expiry"] = trade.get("settlement_price_at_expiry") or settlement_price
         trade["winning_outcome"] = outcomes[winning_index] if 0 <= winning_index < len(outcomes) else None
@@ -678,11 +684,30 @@ async def update_loop():
             current_prices_dict = {"spot": spot_price, "chainlink": current_price}
 
             exec_result = None
+            flip_side = None
             if poly_snapshot["ok"]:
-                await maybe_flip_position(fair_up, poly_snapshot, time_left_min, strike_open, strike_source)
+                flip_side = await maybe_flip_position(fair_up, poly_snapshot, time_left_min, strike_open, strike_source)
                 exec_result = await execute_trade(decision, poly_snapshot["prices"], poly_snapshot["market"], strike_open, poly_snapshot.get("token_ids", {}), poly_snapshot.get("orderbook", {}), strike_source)
 
             await update_trades(current_prices_dict)
+
+            # ── Mark-to-market: value each OPEN position at the current bid of its
+            # held side (what you'd get selling right now) and roll it into equity so
+            # the headline number doesn't just drop by the stake on entry.
+            open_value = 0.0
+            snap_ob = poly_snapshot.get("orderbook", {}) if poly_snapshot.get("ok") else {}
+            snap_market_id = str(poly_snapshot["market"].get("id")) if poly_snapshot.get("ok") else None
+            for t in state["active_trades"]:
+                held_key = "up" if t["side"] == "UP" else "down"
+                # Only trust the live book if this trade is in the market we just snapshotted.
+                if snap_market_id is not None and str(t.get("market_id")) == snap_market_id:
+                    bid = (snap_ob.get(held_key) or {}).get("bestBid")
+                    if bid and bid > 0:
+                        t["cur_bid"] = bid
+                mark = t.get("cur_bid") or t.get("entry_price")  # fall back to entry (neutral) until we see a bid
+                t["unrealized_pl"] = (t["shares"] * mark) - t["amount"]
+                open_value += t["shares"] * mark
+            equity = state["paper_balance"] + open_value
 
             # In live mode, reflect the real on-chain USDC balance in the dashboard
             if state["trading_mode"] == "live":
@@ -693,7 +718,13 @@ async def update_loop():
                         state["paper_balance"] = real_bal
                     state["last_balance_refresh"] = now_ts
 
-            signal_label = f"BUY {decision['side']}" if decision["action"] == "ENTER" else "NO TRADE"
+            # A flip opens a position independently of the EV signal — surface it so
+            # a flip tick never reads as a bare "NO TRADE".
+            if flip_side:
+                signal_label = f"FLIP {flip_side}"
+                exec_result = f"flipped_to_{flip_side}"
+            else:
+                signal_label = f"BUY {decision['side']}" if decision["action"] == "ENTER" else "NO TRADE"
             utils.append_csv_row("./logs/signals.csv", csv_header, [
                 datetime.now().isoformat(), timing["elapsedMinutes"], time_left_min,
                 signal_label, fair_up, 1 - fair_up, market_up, market_down,
@@ -707,7 +738,9 @@ async def update_loop():
                 "market": poly_snapshot.get("market") if poly_snapshot["ok"] else None,
                 "trading_state": {
                     "mode": state["trading_mode"],
-                    "balance": state["paper_balance"],
+                    "balance": state["paper_balance"],     # cash only
+                    "open_value": open_value,              # mark-to-market value of open positions
+                    "equity": equity,                      # cash + open position value
                     "active_trades": state["active_trades"],
                     "history_count": len(state["trade_history"]),
                     "risk": {"type": settings.RISK_TYPE, "value": settings.RISK_VALUE},
