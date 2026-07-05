@@ -329,20 +329,25 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
             log_message(f"LIVE trade FAILED ({side}): {result.get('error')}")
             return "live_order_failed"
 
-async def maybe_flip_position(decision: Dict[str, Any], poly_snapshot: Dict[str, Any], time_left_min: Optional[float]):
-    """Close the open position early and flip when a STRONG opposite signal appears.
+async def maybe_flip_position(fair_up: Optional[float], poly_snapshot: Dict[str, Any], time_left_min: Optional[float],
+                              strike_open: Optional[float], strike_source: str = "binance_open"):
+    """Close the open position early and flip to the side favoured by FAIR PROBABILITY.
 
-    Opt-in (FLIP_ENABLED). Guards: the new side must clear FLIP_MIN_CONVICTION and at
-    least FLIP_MIN_MINUTES_LEFT must remain, and we only flip within the same market.
-    After closing here, execute_trade() opens the new side (slot is now free).
+    EV is NOT considered here — the flip is driven purely by the model's fair
+    probability. Opt-in (FLIP_ENABLED). Guards: the favoured side's fair prob must
+    clear FLIP_MIN_CONVICTION, at least FLIP_MIN_MINUTES_LEFT must remain, and we only
+    flip within the same market. This function both CLOSES the old side and OPENS the
+    new one (the normal execute_trade path is EV-gated and would refuse to re-enter).
     """
     if not settings.FLIP_ENABLED:
         return
-    if decision.get("action") != "ENTER" or not state["active_trades"]:
+    if not state["active_trades"] or fair_up is None:
         return
 
-    new_side = decision["side"]
-    new_prob = decision.get("prob", 0) or 0
+    # Side favoured purely by the fair-probability model (no EV).
+    new_side = "UP" if fair_up >= 0.5 else "DOWN"
+    new_prob = fair_up if new_side == "UP" else (1.0 - fair_up)
+
     if new_prob < settings.FLIP_MIN_CONVICTION:
         return
     if time_left_min is not None and time_left_min < settings.FLIP_MIN_MINUTES_LEFT:
@@ -355,7 +360,7 @@ async def maybe_flip_position(decision: Dict[str, Any], poly_snapshot: Dict[str,
 
     trade = state["active_trades"][0]
     if trade["side"] == new_side:
-        return  # already on the signalled side
+        return  # already on the favoured side — keep holding
     if str(trade.get("market_id")) != str(market.get("id")):
         return  # different market — let the old one settle on its own
 
@@ -385,7 +390,13 @@ async def maybe_flip_position(decision: Dict[str, Any], poly_snapshot: Dict[str,
     state["active_trades"] = [t for t in state["active_trades"] if t is not trade]
     state["last_trade_side"] = None
     save_state()
-    log_message(f"FLIP: closed {trade['side']} @ {exit_price:.2f} (P/L ${trade['profit_loss']:.2f}); opening {new_side}")
+    log_message(f"FLIP: closed {trade['side']} @ {exit_price:.2f} (P/L ${trade['profit_loss']:.2f}); opening {new_side} (fair prob {new_prob:.2f})")
+
+    # Open the new side immediately — driven by FAIR PROBABILITY, not EV. A synthetic
+    # ENTER decision reuses execute_trade's sizing / liquidity / live-order logic.
+    flip_decision = {"action": "ENTER", "side": new_side, "phase": "FLIP", "strength": "FLIP",
+                     "prob": new_prob, "reason": "flip_entry"}
+    await execute_trade(flip_decision, prices, market, strike_open, token_ids, orderbook, strike_source)
 
 async def update_trades(current_prices: Dict[str, Any]):
     remaining_active = []
@@ -668,7 +679,7 @@ async def update_loop():
 
             exec_result = None
             if poly_snapshot["ok"]:
-                await maybe_flip_position(decision, poly_snapshot, time_left_min)
+                await maybe_flip_position(fair_up, poly_snapshot, time_left_min, strike_open, strike_source)
                 exec_result = await execute_trade(decision, poly_snapshot["prices"], poly_snapshot["market"], strike_open, poly_snapshot.get("token_ids", {}), poly_snapshot.get("orderbook", {}), strike_source)
 
             await update_trades(current_prices_dict)
