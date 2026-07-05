@@ -59,10 +59,20 @@
                     </div>
                 </div>
                 <h2 class="text-2xl sm:text-3xl font-mono" x-text="'$' + (data.prices?.chainlink?.toLocaleString() || '-')"></h2>
-                <p class="text-[10px] text-gray-500 mt-1 uppercase tracking-tighter" x-text="'Source: ' + (data.prices?.chainlink_source || '-')"></p>
+                <p class="text-[10px] mt-1 uppercase tracking-tighter">
+                    <span class="text-gray-500">Close src: </span>
+                    <span :class="data.prices?.chainlink_source === 'Polymarket WS' ? 'text-green-400' : 'text-yellow-400'"
+                          x-text="data.prices?.chainlink_source || '-'"></span>
+                </p>
+                <p class="text-[10px] mt-0.5 uppercase tracking-tighter">
+                    <span class="text-gray-500">Open (strike): </span>
+                    <span class="text-gray-300 font-mono" x-text="data.prices?.window_open != null ? ('$' + data.prices.window_open.toLocaleString()) : '-'"></span>
+                    <span :class="data.prices?.window_open_source === 'chainlink_ws' ? 'text-green-400' : 'text-yellow-400'"
+                          x-text="data.prices?.window_open_source ? (' (' + (data.prices.window_open_source === 'chainlink_ws' ? 'Polymarket WS' : 'Binance fallback') + ')') : ''"></span>
+                </p>
                 <!-- Tooltip -->
-                <div class="absolute z-10 hidden group-hover:block bg-black text-white text-[10px] p-2 rounded shadow-xl border border-gray-700 w-48 -bottom-16 left-0">
-                    The real-time settlement price used by Polymarket to resolve the market. This price is sourced via Polymarket's official WS feed or on-chain Chainlink data.
+                <div class="absolute z-10 hidden group-hover:block bg-black text-white text-[10px] p-2 rounded shadow-xl border border-gray-700 w-56 -bottom-24 left-0">
+                    Settlement price used to resolve the market — sourced from Polymarket's WS feed (falls back to Chainlink RPC WS/REST). Win/loss compares this CLOSE vs the marked OPEN. Green = Polymarket WS; yellow = a fallback source.
                 </div>
             </div>
             <div class="bg-gray-800 p-4 sm:p-6 rounded-lg shadow-lg border-l-4 border-purple-500 sm:col-span-2 lg:col-span-1">

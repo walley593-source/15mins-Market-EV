@@ -62,7 +62,12 @@ state = {
     "trade_history": [],
     "logs": [],
     "last_trade_side": None,
-    "last_balance_refresh": 0
+    "last_balance_refresh": 0,
+    # Per-window Chainlink OPEN prices, keyed by window start ms:
+    #   {start_ms: {"chainlink": float|None, "binance": float|None, "genuine": bool}}
+    # Used to settle trades the way Polymarket does (Chainlink close vs open).
+    "market_opens": {},
+    "last_window_start": None
 }
 
 def save_state():
@@ -220,7 +225,7 @@ async def fetch_polymarket_snapshot() -> Dict[str, Any]:
         }
     }
 
-async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any], market: Dict[str, Any], target_open: float, token_ids: Dict[str, Any], orderbook: Optional[Dict[str, Any]] = None):
+async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any], market: Dict[str, Any], target_open: float, token_ids: Dict[str, Any], orderbook: Optional[Dict[str, Any]] = None, strike_source: str = "binance_open"):
     # Regular entry from decision engine. Returns a short reason string describing
     # the outcome (entered / which gate vetoed it) for diagnostic logging.
     if decision["action"] != "ENTER":
@@ -287,6 +292,7 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
         "settlement_price": None,
         "profit_loss": None,
         "strike_price": target_open,
+        "strike_source": strike_source,   # "chainlink_ws" (matches Polymarket) or "binance_open" (fallback)
         "end_ts": end_ts,
         "mode": state["trading_mode"]
     }
@@ -386,10 +392,11 @@ async def update_trades(current_prices: Dict[str, Any]):
     trades_changed = False
     now_ts = time.time()
 
-    # Freshest price to settle against. Strike is the Binance 5m open (target_open),
-    # so prefer spot (Binance) to avoid a Binance/Chainlink offset flipping a
-    # near-the-money result; fall back to the chainlink feed.
-    cur_price = current_prices.get("spot") or current_prices.get("chainlink")
+    # Freshest price to settle against — the CLOSE price. Polymarket settles on
+    # Chainlink, and the strike (open) is now the Chainlink WS value too, so prefer
+    # Chainlink here so open and close come from the SAME feed (no cross-feed offset
+    # can flip a near-the-money result). Binance spot is only a last-resort fallback.
+    cur_price = current_prices.get("chainlink") or current_prices.get("spot")
     SETTLEMENT_GRACE_SECONDS = 300  # if still unresolvable this long past expiry, void it
 
     for trade in state["active_trades"]:
@@ -578,15 +585,54 @@ async def update_loop():
             current_price = None
             price_source = None
 
-            if cl_ws.get("price"):
-                current_price = cl_ws["price"]
-                price_source = "Chainlink RPC WS"
-            elif poly_ws.get("price"):
+            # Prefer Polymarket's OWN Chainlink WS feed — it's the exact price stream
+            # Polymarket settles on, so marking open/close from it matches the market
+            # most faithfully. Fall back to the direct Chainlink RPC WS, then REST.
+            if poly_ws.get("price"):
                 current_price = poly_ws["price"]
                 price_source = "Polymarket WS"
+            elif cl_ws.get("price"):
+                current_price = cl_ws["price"]
+                price_source = "Chainlink RPC WS"
             elif chainlink_data.get("price"):
                 current_price = chainlink_data["price"]
                 price_source = "Chainlink RPC REST"
+
+            # ── Mark each 15m window's OPEN price from the Chainlink WS feed ──────
+            # Polymarket's BTC "Up or Down" markets settle on Chainlink: the close
+            # price vs the price at the window's open. We snapshot the Chainlink WS
+            # price the instant a window opens, then compare the Chainlink price at
+            # expiry against it (see update_trades). `current_price` is already the
+            # Chainlink WS value (RPC WS → Polymarket WS → RPC REST), so open and
+            # close come from the SAME feed — no Binance/Chainlink offset to flip a
+            # near-the-money result. Binance is only a fallback for the open when the
+            # bot was NOT running at the window start (so we never saw the real open).
+            start_ms = timing["startMs"]
+            window_ms = settings.CANDLE_WINDOW_MINUTES * 60_000
+            opens = state["market_opens"]
+            # "genuine" == we were already running in the immediately-preceding
+            # window, so the first price we see in this one really is its open.
+            observed_prev = state.get("last_window_start") == start_ms - window_ms
+            if start_ms not in opens:
+                opens[start_ms] = {"chainlink": None, "binance": None, "genuine": observed_prev}
+                for k in list(opens.keys()):           # prune old windows
+                    if k < start_ms - 4 * window_ms:
+                        del opens[k]
+            win = opens[start_ms]
+            if win["binance"] is None and target_open:
+                win["binance"] = target_open           # Binance 5m open (fallback strike)
+            if (win["chainlink"] is None and win["genuine"] and current_price
+                    and (time.time() * 1000 - start_ms) < 20_000):
+                win["chainlink"] = current_price        # Chainlink open, captured at the boundary
+                log_message(f"Window open marked (Chainlink): {current_price:.2f} @ {price_source}")
+            state["last_window_start"] = start_ms
+
+            # Strike (open) for a trade entered now: the Chainlink open if we captured
+            # it, else the Binance 5m open as a fallback.
+            chainlink_open = win["chainlink"]
+            strike_open = chainlink_open if chainlink_open is not None else (win["binance"] or target_open)
+            strike_source = "chainlink_ws" if chainlink_open is not None else "binance_open"
+
             settlement_ms = None
             if poly_snapshot["ok"] and poly_snapshot["market"].get("endDate"):
                 settlement_ms = datetime.fromisoformat(poly_snapshot["market"]["endDate"].replace('Z', '+00:00')).timestamp() * 1000
@@ -623,7 +669,7 @@ async def update_loop():
             exec_result = None
             if poly_snapshot["ok"]:
                 await maybe_flip_position(decision, poly_snapshot, time_left_min)
-                exec_result = await execute_trade(decision, poly_snapshot["prices"], poly_snapshot["market"], target_open, poly_snapshot.get("token_ids", {}), poly_snapshot.get("orderbook", {}))
+                exec_result = await execute_trade(decision, poly_snapshot["prices"], poly_snapshot["market"], strike_open, poly_snapshot.get("token_ids", {}), poly_snapshot.get("orderbook", {}), strike_source)
 
             await update_trades(current_prices_dict)
 
@@ -661,7 +707,9 @@ async def update_loop():
                     "chainlink": current_price,
                     "chainlink_source": price_source,
                     "poly_up": market_up,
-                    "poly_down": market_down
+                    "poly_down": market_down,
+                    "window_open": strike_open,          # this window's marked OPEN (strike)
+                    "window_open_source": strike_source  # "chainlink_ws" (Polymarket) or "binance_open" fallback
                 },
                 "indicators": {
                     "fair": fair_data
