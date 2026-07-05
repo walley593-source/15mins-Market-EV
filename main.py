@@ -225,7 +225,7 @@ async def fetch_polymarket_snapshot() -> Dict[str, Any]:
         }
     }
 
-async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any], market: Dict[str, Any], target_open: float, token_ids: Dict[str, Any], orderbook: Optional[Dict[str, Any]] = None, strike_source: str = "binance_open"):
+async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any], market: Dict[str, Any], target_open: float, token_ids: Dict[str, Any], orderbook: Optional[Dict[str, Any]] = None, strike_source: str = "chainlink_ws"):
     # Regular entry from decision engine. Returns a short reason string describing
     # the outcome (entered / which gate vetoed it) for diagnostic logging.
     if decision["action"] != "ENTER":
@@ -234,6 +234,11 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
     # CONSTRAINT: Only one position at a time
     if state["active_trades"]:
         return "slot_busy"
+
+    # No Polymarket/Chainlink open for this window → do NOT open. We can't score the
+    # trade against a real open, so we wait for the next window where we mark it.
+    if target_open is None:
+        return "no_open_price"
 
     side = decision["side"]
 
@@ -336,27 +341,48 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
             return "live_order_failed"
 
 async def maybe_flip_position(fair_up: Optional[float], poly_snapshot: Dict[str, Any], time_left_min: Optional[float],
-                              strike_open: Optional[float], strike_source: str = "binance_open"):
+                              strike_open: Optional[float], strike_source: str = "chainlink_ws"):
     """Close the open position early and flip to the side favoured by FAIR PROBABILITY.
 
     EV is NOT considered here — the flip is driven purely by the model's fair
     probability. Opt-in (FLIP_ENABLED). Guards: the favoured side's fair prob must
-    clear FLIP_MIN_CONVICTION, at least FLIP_MIN_MINUTES_LEFT must remain, and we only
-    flip within the same market. This function both CLOSES the old side and OPENS the
-    new one (the normal execute_trade path is EV-gated and would refuse to re-enter).
+    clear FLIP_MIN_CONVICTION, at least FLIP_MIN_MINUTES_LEFT must remain, we only flip
+    within the same market, and we must have this window's Chainlink open. This
+    function both CLOSES the old side and OPENS the new one (the normal execute_trade
+    path is EV-gated and would refuse to re-enter).
+
+    Every skip is logged (once per reason-change) so it's always visible WHY a flip
+    that "should" have happened did not.
     """
+    def _skip(reason: str):
+        if state.get("last_flip_skip") != reason:
+            state["last_flip_skip"] = reason
+            log_message(f"FLIP skipped: {reason}")
+
     if not settings.FLIP_ENABLED:
         return
     if not state["active_trades"] or fair_up is None:
         return
 
+    trade = state["active_trades"][0]
+
     # Side favoured purely by the fair-probability model (no EV).
     new_side = "UP" if fair_up >= 0.5 else "DOWN"
     new_prob = fair_up if new_side == "UP" else (1.0 - fair_up)
 
+    # Only interesting once the model favours the OPPOSITE side of what we hold.
+    if trade["side"] == new_side:
+        state["last_flip_skip"] = None  # back on the held side — reset
+        return
+
     if new_prob < settings.FLIP_MIN_CONVICTION:
+        _skip(f"{new_side} conviction {new_prob:.2f} < {settings.FLIP_MIN_CONVICTION:.2f}")
+        return
+    if strike_open is None:
+        _skip("no Chainlink open captured for this window")
         return
     if time_left_min is not None and time_left_min < settings.FLIP_MIN_MINUTES_LEFT:
+        _skip(f"only {time_left_min:.1f}m left < {settings.FLIP_MIN_MINUTES_LEFT:.0f}m required")
         return
 
     market = poly_snapshot["market"]
@@ -364,18 +390,18 @@ async def maybe_flip_position(fair_up: Optional[float], poly_snapshot: Dict[str,
     token_ids = poly_snapshot.get("token_ids", {})
     orderbook = poly_snapshot.get("orderbook", {})
 
-    trade = state["active_trades"][0]
-    if trade["side"] == new_side:
-        return  # already on the favoured side — keep holding
     if str(trade.get("market_id")) != str(market.get("id")):
-        return  # different market — let the old one settle on its own
+        _skip("position is in a prior market (window rolled)")
+        return
 
     held_key = "up" if trade["side"] == "UP" else "down"
     ob = orderbook.get(held_key) or {}
     exit_price = ob.get("bestBid") or prices.get(held_key)
     if not exit_price or exit_price <= 0:
-        log_message(f"FLIP aborted: no exit price for {trade['side']}")
+        _skip(f"no exit price for {trade['side']}")
         return
+
+    state["last_flip_skip"] = None  # clearing — we're about to flip
 
     if state["trading_mode"] == "live":
         token_id = token_ids.get(held_key)
@@ -679,24 +705,24 @@ async def update_loop():
             # window, so the first price we see in this one really is its open.
             observed_prev = prev_ws == start_ms - window_ms
             if start_ms not in opens:
-                opens[start_ms] = {"chainlink": None, "binance": None, "close": None, "genuine": observed_prev}
+                opens[start_ms] = {"chainlink": None, "close": None, "genuine": observed_prev}
                 for k in list(opens.keys()):           # prune old windows
                     if k < start_ms - 4 * window_ms:
                         del opens[k]
             win = opens[start_ms]
-            if win["binance"] is None and target_open:
-                win["binance"] = target_open           # Binance 5m open (fallback strike)
             if (win["chainlink"] is None and win["genuine"] and current_price
                     and (time.time() * 1000 - start_ms) < 20_000):
                 win["chainlink"] = current_price        # Chainlink open, captured at the boundary
                 log_message(f"Window open marked (Chainlink): {current_price:.2f} @ {price_source}")
             state["last_window_start"] = start_ms
 
-            # Strike (open) for a trade entered now: the Chainlink open if we captured
-            # it, else the Binance 5m open as a fallback.
+            # Strike (open) for a trade entered now: ONLY the Chainlink (Polymarket WS)
+            # open. If we didn't capture this window's open (e.g. the bot wasn't running
+            # at the boundary), strike_open stays None and NO trade is opened this
+            # window — we wait for the next window where we can mark the real open.
             chainlink_open = win["chainlink"]
-            strike_open = chainlink_open if chainlink_open is not None else (win["binance"] or target_open)
-            strike_source = "chainlink_ws" if chainlink_open is not None else "binance_open"
+            strike_open = chainlink_open          # None until/unless captured
+            strike_source = "chainlink_ws"
 
             settlement_ms = None
             if poly_snapshot["ok"] and poly_snapshot["market"].get("endDate"):
