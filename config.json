@@ -36,7 +36,7 @@
     "min_book_liquidity_usd": 20
   },
   "flip": {
-    "enabled": true,
+    "enabled": false,
     "min_conviction": 0.65,
     "min_minutes_left": 4
   },
