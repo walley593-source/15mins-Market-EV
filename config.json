@@ -31,9 +31,8 @@
     "risk_value": 10
   },
   "ev": {
-    "ev_threshold": 0.06,
+    "ev_threshold": 0.04,
     "min_prob": 0.55,
-    "max_entry_price": 0.49,
     "min_book_liquidity_usd": 20
   },
   "flip": {

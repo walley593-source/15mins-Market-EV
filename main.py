@@ -829,7 +829,6 @@ async def update_loop():
                 "priceDown": market_down,
                 "minProb": settings.MIN_PROB_EV,
                 "evThreshold": settings.EV_THRESHOLD,
-                "maxEntryPrice": settings.MAX_ENTRY_PRICE,
             })
 
             current_prices_dict = {"spot": spot_price, "chainlink": current_price}
@@ -1016,7 +1015,6 @@ async def get_settings():
         "ev": {
             "ev_threshold": settings.EV_THRESHOLD,
             "min_prob": settings.MIN_PROB_EV,
-            "max_entry_price": settings.MAX_ENTRY_PRICE,
             "min_book_liquidity_usd": settings.MIN_BOOK_LIQUIDITY_USD
         },
         "flip": {
@@ -1085,7 +1083,6 @@ async def post_settings(new_settings: Dict[str, Any]):
         e = new_settings["ev"]
         settings.EV_THRESHOLD = float(e.get("ev_threshold", settings.EV_THRESHOLD))
         settings.MIN_PROB_EV = float(e.get("min_prob", settings.MIN_PROB_EV))
-        settings.MAX_ENTRY_PRICE = float(e.get("max_entry_price", settings.MAX_ENTRY_PRICE))
         settings.MIN_BOOK_LIQUIDITY_USD = float(e.get("min_book_liquidity_usd", settings.MIN_BOOK_LIQUIDITY_USD))
 
     if "flip" in new_settings:

@@ -41,9 +41,8 @@ class Settings(BaseSettings):
     # ── Latency-arb entry engine ────────────────────────────────────────────────
     # Fair probability (fast, from Binance spot) vs Polymarket's implied price.
     # Enter when EV = fair - ask_price clears EV_THRESHOLD (the book looks stale).
-    EV_THRESHOLD: float = 0.06          # require >= this expected value per $1 share (after price)
+    EV_THRESHOLD: float = 0.04          # require >= this expected value per $1 share (after price)
     MIN_PROB_EV: float = 0.55           # don't bet near-coinflips even if EV looks positive
-    MAX_ENTRY_PRICE: float = 0.49       # value cap: never pay more than this for the chosen side
     MIN_BOOK_LIQUIDITY_USD: float = 20.0  # skip if the ask side can't absorb the stake
 
     # Close-and-flip the open position on a strong opposite signal
@@ -156,7 +155,6 @@ def load_settings():
                 ev = config_data["ev"]
                 if "ev_threshold" in ev: base_settings.EV_THRESHOLD = float(ev["ev_threshold"])
                 if "min_prob" in ev: base_settings.MIN_PROB_EV = float(ev["min_prob"])
-                if "max_entry_price" in ev: base_settings.MAX_ENTRY_PRICE = float(ev["max_entry_price"])
                 if "min_book_liquidity_usd" in ev: base_settings.MIN_BOOK_LIQUIDITY_USD = float(ev["min_book_liquidity_usd"])
 
             if "flip" in config_data:

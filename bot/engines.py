@@ -8,11 +8,9 @@ from typing import Dict, Any
 #  market. The only edge left is LATENCY: act on a Binance spot move before
 #  Polymarket's thin book reprices.
 #
-#  The decision is a fast fair probability (from Binance spot) vs the market's
-#  implied price. Enter when the gap (expected value) is large enough that the
-#  book looks stale AND the chosen side is still cheap (price < MAX_ENTRY_PRICE).
-#  Data finding: the edge is a VALUE edge — buying the underpriced side (< ~50c)
-#  wins; paying up for a near-favourite (50c+) loses. The price cap enforces that.
+#  The decision is purely a fast fair probability (from Binance spot) vs the
+#  market's implied price. Enter when the gap (expected value) is large enough
+#  that the book looks stale. There are no other filters.
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -28,8 +26,7 @@ def decide_ev(inputs: Dict[str, Any]) -> Dict[str, Any]:
 
     EV_side = p_side - ask_price_side. A positive EV beyond `evThreshold` means the
     book is underpricing the side our fast feed already favours — the latency edge.
-    A hard `maxEntryPrice` cap then rejects paying up for near-favourites (the data's
-    dead zone). Position sizing (percent/fixed of balance) is handled by the caller.
+    Position sizing (percent/fixed of balance) is handled by the caller.
     """
     p_up = inputs.get("mcProbUp")
     price_up = inputs.get("priceUp")     # ask (buy) price for the UP share, 0..1
@@ -50,14 +47,9 @@ def decide_ev(inputs: Dict[str, Any]) -> Dict[str, Any]:
     ev = ev_up if side == "UP" else ev_down
 
     min_prob = inputs.get("minProb", 0.55)
-    ev_threshold = inputs.get("evThreshold", 0.06)
-    max_entry_price = inputs.get("maxEntryPrice", 0.49)
+    ev_threshold = inputs.get("evThreshold", 0.04)
 
     # ── GATES ──
-    # Value cap: only buy a side the market still prices cheap. Above this, the
-    # model's "edge" is empirically spurious (wins less than the price implies).
-    if max_entry_price is not None and price is not None and price > max_entry_price:
-        return _no_ev(f"price_{price:.2f}_above_{max_entry_price:.2f}", side, p, price, ev)
     if p < min_prob:
         return _no_ev(f"prob_{p:.2f}_below_{min_prob:.2f}", side, p, price, ev)
     if ev < ev_threshold:
