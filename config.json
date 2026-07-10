@@ -9,7 +9,6 @@
     "enabled": false,
     "trigger_balance": 2000,
     "withdraw_amount": 1000,
-    "withdraw_address": "",
     "auto_resume_after_withdrawal": true,
     "resume_after": "submitted"
   },

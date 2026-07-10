@@ -616,7 +616,7 @@ async def maybe_auto_withdraw():
 
     While the state is not ARMED, new entries/flips are paused (see update_loop) so
     the account can settle flat before funds are extracted. Withdraws WITHDRAW_AMOUNT
-    of pUSD to WITHDRAW_ADDRESS (gasless via the relayer)."""
+    of pUSD to your own wallet — the EOA derived from the key/seed (gasless)."""
     if state["trading_mode"] != "live" or not settings.AUTO_WITHDRAW_ENABLED:
         if state["withdraw_state"] != "ARMED":   # disabled → never keep entries paused
             state["withdraw_state"] = "ARMED"
@@ -637,9 +637,8 @@ async def maybe_auto_withdraw():
             log_message("Auto-withdraw: account is flat → withdrawing")
 
     elif st == "WITHDRAWING":
-        # Destination is YOUR own wallet — the EOA derived from the key/seed. An
-        # optional WITHDRAW_ADDRESS overrides it; blank = send to your EOA.
-        recipient = settings.WITHDRAW_ADDRESS or clob_trader.get_eoa_address()
+        # Destination is ALWAYS your own wallet — the EOA derived from the key/seed.
+        recipient = clob_trader.get_eoa_address()
         if not recipient:
             log_message("Auto-withdraw aborted: no wallet/key available. Disarming.")
             state["withdraw_state"] = "ARMED"
@@ -998,7 +997,6 @@ async def get_settings():
             "enabled": settings.AUTO_WITHDRAW_ENABLED,
             "trigger_balance": settings.WITHDRAW_TRIGGER_BALANCE,
             "withdraw_amount": settings.WITHDRAW_AMOUNT,
-            "withdraw_address": settings.WITHDRAW_ADDRESS,
             "auto_resume_after_withdrawal": settings.WITHDRAW_AUTO_RESUME,
             "resume_after": settings.WITHDRAW_RESUME_AFTER
         },
@@ -1116,7 +1114,6 @@ async def post_settings(new_settings: Dict[str, Any]):
         if "enabled" in ce: settings.AUTO_WITHDRAW_ENABLED = bool(ce["enabled"])
         if "trigger_balance" in ce: settings.WITHDRAW_TRIGGER_BALANCE = float(ce["trigger_balance"])
         if "withdraw_amount" in ce: settings.WITHDRAW_AMOUNT = float(ce["withdraw_amount"])
-        if "withdraw_address" in ce: settings.WITHDRAW_ADDRESS = ce["withdraw_address"]
         if "auto_resume_after_withdrawal" in ce: settings.WITHDRAW_AUTO_RESUME = bool(ce["auto_resume_after_withdrawal"])
         if "resume_after" in ce: settings.WITHDRAW_RESUME_AFTER = ce["resume_after"]
 

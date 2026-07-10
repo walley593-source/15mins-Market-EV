@@ -18,11 +18,11 @@ class Settings(BaseSettings):
 
     # ── Auto-withdrawal (capital extractor) ─────────────────────────────────────
     # When the live balance reaches TRIGGER, pause entries, wait until flat, then
-    # withdraw AMOUNT of pUSD to WITHDRAW_ADDRESS (gasless) and auto-resume trading.
+    # withdraw AMOUNT of pUSD to your own wallet (the key/seed EOA) and auto-resume.
     AUTO_WITHDRAW_ENABLED: bool = False
     WITHDRAW_TRIGGER_BALANCE: float = 2000.0  # withdraw once balance reaches this
     WITHDRAW_AMOUNT: float = 1000.0           # amount of pUSD to withdraw each time
-    WITHDRAW_ADDRESS: str = ""                # destination wallet (required to withdraw)
+    # Destination is ALWAYS your own wallet — the EOA derived from PRIVATE_KEY / seed.
     WITHDRAW_AUTO_RESUME: bool = True         # resume trading after the withdrawal
     WITHDRAW_RESUME_AFTER: str = "submitted"  # "submitted" or "confirmed"
 
@@ -129,7 +129,6 @@ def load_settings():
                 if "enabled" in ce: base_settings.AUTO_WITHDRAW_ENABLED = bool(ce["enabled"])
                 if "trigger_balance" in ce: base_settings.WITHDRAW_TRIGGER_BALANCE = float(ce["trigger_balance"])
                 if "withdraw_amount" in ce: base_settings.WITHDRAW_AMOUNT = float(ce["withdraw_amount"])
-                if "withdraw_address" in ce: base_settings.WITHDRAW_ADDRESS = ce["withdraw_address"]
                 if "auto_resume_after_withdrawal" in ce: base_settings.WITHDRAW_AUTO_RESUME = bool(ce["auto_resume_after_withdrawal"])
                 if "resume_after" in ce: base_settings.WITHDRAW_RESUME_AFTER = ce["resume_after"]
 

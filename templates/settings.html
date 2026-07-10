@@ -169,9 +169,7 @@
                         <p class="text-[10px] text-gray-500 mt-2 italic">Amount of pUSD to withdraw each time (e.g. 1000 = half of 2000).</p>
                     </div>
                     <div class="md:col-span-2">
-                        <label class="block text-gray-400 text-xs sm:text-sm mb-2 uppercase font-bold tracking-wider">Withdraw To (optional override)</label>
-                        <input type="text" x-model="form.capital_extractor.withdraw_address" class="w-full bg-gray-700 border-none rounded-lg p-3 text-white focus:ring-2 focus:ring-blue-500 transition" placeholder="Leave blank → sends to your own wallet (the key/seed address)">
-                        <p class="text-[10px] text-gray-500 mt-2 italic">Defaults to <strong>your own wallet</strong> — the EOA derived from your private key / seed phrase. Leave blank to send there. Only set an address here if you want to send the pUSD somewhere else; withdrawals move real funds and cannot be undone.</p>
+                        <p class="text-[10px] text-gray-400 italic bg-gray-900/40 rounded-lg p-3">Withdrawals are sent automatically to <strong>your own wallet</strong> — the address derived from your private key / seed phrase. No destination to configure.</p>
                     </div>
                     <div>
                         <label class="flex items-center gap-2 mt-1">
@@ -210,7 +208,7 @@
                     private_key: '',
                     relayer: { api_key: '' },
                     chainlink: { alchemy_api_key: '' },
-                    capital_extractor: { enabled: false, trigger_balance: 2000, withdraw_amount: 1000, withdraw_address: '', auto_resume_after_withdrawal: true, resume_after: 'submitted' },
+                    capital_extractor: { enabled: false, trigger_balance: 2000, withdraw_amount: 1000, auto_resume_after_withdrawal: true, resume_after: 'submitted' },
                     polymarket: { series_id: '' },
                     trading: { symbol: '', risk_type: 'percent', risk_value: 10 },
                     ev: { ev_threshold: 0.06, min_prob: 0.55, max_entry_price: 0.49, min_book_liquidity_usd: 20.0 },
