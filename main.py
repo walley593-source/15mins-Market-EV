@@ -63,6 +63,12 @@ state = {
     "logs": [],
     "last_trade_side": None,
     "last_balance_refresh": 0,
+    "running": False,   # trading is OFF until the user presses Start on the dashboard
+    # Auto-withdrawal (capital extractor) state machine:
+    #   ARMED -> (balance>=trigger) WAITING_FLAT -> (no open trades) WITHDRAWING
+    #         -> WITHDRAW_SUBMITTED -> ARMED (+ resume)
+    "withdraw_state": "ARMED",
+    "last_withdrawal": None,   # {"amount","tx","time"} of the most recent withdrawal
     # Per-window Chainlink OPEN prices, keyed by window start ms:
     #   {start_ms: {"chainlink": float|None, "binance": float|None, "genuine": bool}}
     # Used to settle trades the way Polymarket does (Chainlink close vs open).
@@ -375,6 +381,13 @@ async def maybe_flip_position(fair_up: Optional[float], poly_snapshot: Dict[str,
         state["last_flip_skip"] = None  # back on the held side — reset
         return
 
+    # ONE FLIP PER MARKET: if this position is itself the result of a flip, hold it
+    # to settlement — never flip again. (Analysis showed the flip *trigger* is usually
+    # right, but repeated flipping/churn bleeds the edge on spread + late re-entries.)
+    if trade.get("open_reason") == "flip_entry":
+        _skip("already flipped once this market — holding to settlement")
+        return
+
     if new_prob < settings.FLIP_MIN_CONVICTION:
         _skip(f"{new_side} conviction {new_prob:.2f} < {settings.FLIP_MIN_CONVICTION:.2f}")
         return
@@ -595,6 +608,68 @@ async def update_trades(current_prices: Dict[str, Any]):
     if trades_changed:
         save_state()
 
+async def maybe_auto_withdraw():
+    """Auto-withdrawal (capital extractor) state machine — LIVE mode only.
+
+        ARMED --(balance >= trigger)--> WAITING_FLAT --(no open trades)--> WITHDRAWING
+              --(withdrawal submitted)--> WITHDRAW_SUBMITTED --> ARMED (+ auto-resume)
+
+    While the state is not ARMED, new entries/flips are paused (see update_loop) so
+    the account can settle flat before funds are extracted. Withdraws WITHDRAW_AMOUNT
+    of pUSD to WITHDRAW_ADDRESS (gasless via the relayer)."""
+    if state["trading_mode"] != "live" or not settings.AUTO_WITHDRAW_ENABLED:
+        if state["withdraw_state"] != "ARMED":   # disabled → never keep entries paused
+            state["withdraw_state"] = "ARMED"
+        return
+
+    st = state["withdraw_state"]
+    bal = state["paper_balance"]  # live pUSD balance is mirrored here
+
+    if st == "ARMED":
+        if bal is not None and bal >= settings.WITHDRAW_TRIGGER_BALANCE:
+            state["withdraw_state"] = "WAITING_FLAT"
+            log_message(f"Auto-withdraw: balance ${bal:.2f} >= ${settings.WITHDRAW_TRIGGER_BALANCE:.2f} → pausing entries, waiting to go flat")
+
+    elif st == "WAITING_FLAT":
+        # FOK market orders never rest, so "flat" == no open positions.
+        if not state["active_trades"]:
+            state["withdraw_state"] = "WITHDRAWING"
+            log_message("Auto-withdraw: account is flat → withdrawing")
+
+    elif st == "WITHDRAWING":
+        # Destination is YOUR own wallet — the EOA derived from the key/seed. An
+        # optional WITHDRAW_ADDRESS overrides it; blank = send to your EOA.
+        recipient = settings.WITHDRAW_ADDRESS or clob_trader.get_eoa_address()
+        if not recipient:
+            log_message("Auto-withdraw aborted: no wallet/key available. Disarming.")
+            state["withdraw_state"] = "ARMED"
+            return
+        amount = min(float(settings.WITHDRAW_AMOUNT), float(bal or 0))
+        if amount <= 0:
+            state["withdraw_state"] = "ARMED"
+            return
+        result = await asyncio.to_thread(clob_trader.withdraw_pusd, recipient, amount)
+        if result.get("ok"):
+            state["last_withdrawal"] = {"amount": result.get("amount"), "tx": result.get("tx"),
+                                        "to": result.get("recipient"), "time": datetime.now().isoformat()}
+            state["withdraw_state"] = "WITHDRAW_SUBMITTED"
+            log_message(f"Auto-withdraw: submitted ${amount:.2f} → {recipient} (tx {result.get('tx')})")
+        else:
+            log_message(f"Auto-withdraw FAILED: {result.get('error')}. Disarming.")
+            state["withdraw_state"] = "ARMED"
+
+    elif st == "WITHDRAW_SUBMITTED":
+        # resume_after 'submitted' (default) — transfer_pusd already waited for a
+        # receipt, so treat it as good and resume immediately.
+        state["last_balance_refresh"] = 0  # force a fresh balance read so we don't re-trigger on a stale value
+        if not settings.WITHDRAW_AUTO_RESUME:
+            state["running"] = False
+            log_message("Auto-withdraw complete; auto-resume OFF → bot stopped.")
+        else:
+            log_message("Auto-withdraw complete; trading resumed.")
+        state["withdraw_state"] = "ARMED"
+
+
 async def seed_kline_buffers():
     try:
         k1m, k5m = await asyncio.gather(
@@ -611,6 +686,8 @@ async def update_loop():
     csv_header = [
         "timestamp", "entry_minute", "time_left_min", "signal",
         "model_up", "model_down", "mkt_up", "mkt_down", "edge_up", "edge_down",
+        # Chosen-side inputs on EVERY tick (even no-trade) so filters can be mined later:
+        "chosen_side", "chosen_prob", "chosen_price", "chosen_ev",
         "recommendation", "reason", "exec_result"
     ]
 
@@ -753,15 +830,22 @@ async def update_loop():
                 "priceDown": market_down,
                 "minProb": settings.MIN_PROB_EV,
                 "evThreshold": settings.EV_THRESHOLD,
+                "maxEntryPrice": settings.MAX_ENTRY_PRICE,
             })
 
             current_prices_dict = {"spot": spot_price, "chainlink": current_price}
 
             exec_result = None
             flip_side = None
-            if poly_snapshot["ok"]:
+            # Entries/flips run only when the user has STARTED the bot and no
+            # withdrawal is pending (during a withdrawal we pause and let open
+            # positions settle so the account can go flat before extracting funds).
+            entries_allowed = state["running"] and state["withdraw_state"] == "ARMED"
+            if poly_snapshot["ok"] and entries_allowed:
                 flip_side = await maybe_flip_position(fair_up, poly_snapshot, time_left_min, strike_open, strike_source)
                 exec_result = await execute_trade(decision, poly_snapshot["prices"], poly_snapshot["market"], strike_open, poly_snapshot.get("token_ids", {}), poly_snapshot.get("orderbook", {}), strike_source)
+            elif not state["running"]:
+                exec_result = "stopped"
 
             await update_trades(current_prices_dict)
 
@@ -803,14 +887,17 @@ async def update_loop():
             if backfilled:
                 save_state()
 
-            # In live mode, reflect the real on-chain USDC balance in the dashboard
+            # In live mode, reflect the real on-chain pUSD balance in the dashboard
+            # (refreshed ~10s so the header balance tracks near-realtime).
             if state["trading_mode"] == "live":
                 now_ts = time.time()
-                if now_ts - state.get("last_balance_refresh", 0) > 30:
+                if now_ts - state.get("last_balance_refresh", 0) > 10:
                     real_bal = await asyncio.to_thread(clob_trader.get_usdc_balance)
                     if real_bal is not None:
                         state["paper_balance"] = real_bal
                     state["last_balance_refresh"] = now_ts
+                # Auto-withdrawal (capital extractor) — pause/flat/withdraw/resume.
+                await maybe_auto_withdraw()
 
             # A flip opens a position independently of the EV signal — surface it so
             # a flip tick never reads as a bare "NO TRADE".
@@ -822,7 +909,10 @@ async def update_loop():
             utils.append_csv_row("./logs/signals.csv", csv_header, [
                 datetime.now().isoformat(), timing["elapsedMinutes"], time_left_min,
                 signal_label, fair_up, 1 - fair_up, market_up, market_down,
-                edge["edgeUp"], edge["edgeDown"], f"{decision['side']}:{decision['phase']}:{decision['strength']}" if decision["action"] == "ENTER" else "NO_TRADE",
+                edge["edgeUp"], edge["edgeDown"],
+                # chosen-side prob/price/ev — present on ENTER and NO_TRADE alike
+                decision.get("side"), decision.get("prob"), decision.get("price"), decision.get("ev"),
+                f"{decision['side']}:{decision['phase']}:{decision['strength']}" if decision["action"] == "ENTER" else "NO_TRADE",
                 decision.get("reason", ""), exec_result or ""
             ])
 
@@ -838,7 +928,15 @@ async def update_loop():
                     "active_trades": state["active_trades"],
                     "history_count": len(state["trade_history"]),
                     "risk": {"type": settings.RISK_TYPE, "value": settings.RISK_VALUE},
-                    "symbol": settings.SYMBOL
+                    "symbol": settings.SYMBOL,
+                    "running": state["running"],
+                    "withdraw": {
+                        "enabled": settings.AUTO_WITHDRAW_ENABLED,
+                        "state": state["withdraw_state"],
+                        "trigger_balance": settings.WITHDRAW_TRIGGER_BALANCE,
+                        "amount": settings.WITHDRAW_AMOUNT,
+                        "last": state["last_withdrawal"],
+                    }
                 },
                 "prices": {
                     "spot": spot_price,
@@ -893,9 +991,16 @@ async def get_settings():
         "mode": settings.MODE,
         "paper_balance_usd": settings.PAPER_BALANCE_USD,
         "private_key": masked_pk,
-        "live": {
-            "signature_type": settings.CLOB_SIGNATURE_TYPE,
-            "funder": settings.CLOB_FUNDER
+        "relayer": {
+            "api_key": "set" if settings.RELAYER_API_KEY else ""
+        },
+        "capital_extractor": {
+            "enabled": settings.AUTO_WITHDRAW_ENABLED,
+            "trigger_balance": settings.WITHDRAW_TRIGGER_BALANCE,
+            "withdraw_amount": settings.WITHDRAW_AMOUNT,
+            "withdraw_address": settings.WITHDRAW_ADDRESS,
+            "auto_resume_after_withdrawal": settings.WITHDRAW_AUTO_RESUME,
+            "resume_after": settings.WITHDRAW_RESUME_AFTER
         },
         "polymarket": {
             "series_id": settings.POLYMARKET_SERIES_ID,
@@ -913,12 +1018,16 @@ async def get_settings():
         "ev": {
             "ev_threshold": settings.EV_THRESHOLD,
             "min_prob": settings.MIN_PROB_EV,
+            "max_entry_price": settings.MAX_ENTRY_PRICE,
             "min_book_liquidity_usd": settings.MIN_BOOK_LIQUIDITY_USD
         },
         "flip": {
             "enabled": settings.FLIP_ENABLED,
             "min_conviction": settings.FLIP_MIN_CONVICTION,
             "min_minutes_left": settings.FLIP_MIN_MINUTES_LEFT
+        },
+        "chainlink": {
+            "alchemy_api_key": "set" if settings.ALCHEMY_API_KEY else ""
         }
     }
 
@@ -929,9 +1038,19 @@ async def post_settings(new_settings: Dict[str, Any]):
 
     new_pk = new_settings.get("private_key")
     if new_pk and "..." in new_pk:
+        # masked value returned by GET — keep the stored key unchanged
         new_settings["private_key"] = settings.PRIVATE_KEY
-    elif new_pk:
-        settings.PRIVATE_KEY = new_pk
+    elif new_pk is not None:
+        from bot.config import normalize_private_key
+        settings.PRIVATE_KEY = normalize_private_key(new_pk)
+        new_settings["private_key"] = settings.PRIVATE_KEY  # persist the derived hex key, never the seed
+
+    # "set" is the masked sentinel returned by GET for stored secrets — if the form
+    # sends it back unchanged, don't overwrite the real key with the sentinel.
+    if isinstance(new_settings.get("relayer"), dict) and new_settings["relayer"].get("api_key") == "set":
+        new_settings["relayer"].pop("api_key", None)
+    if isinstance(new_settings.get("chainlink"), dict) and new_settings["chainlink"].get("alchemy_api_key") == "set":
+        new_settings["chainlink"].pop("alchemy_api_key", None)
 
     # Deep-merge into the existing config so keys not present in the settings form
     # (chainlink, binance_base_url, poll_interval_ms, etc.) are preserved.
@@ -968,6 +1087,7 @@ async def post_settings(new_settings: Dict[str, Any]):
         e = new_settings["ev"]
         settings.EV_THRESHOLD = float(e.get("ev_threshold", settings.EV_THRESHOLD))
         settings.MIN_PROB_EV = float(e.get("min_prob", settings.MIN_PROB_EV))
+        settings.MAX_ENTRY_PRICE = float(e.get("max_entry_price", settings.MAX_ENTRY_PRICE))
         settings.MIN_BOOK_LIQUIDITY_USD = float(e.get("min_book_liquidity_usd", settings.MIN_BOOK_LIQUIDITY_USD))
 
     if "flip" in new_settings:
@@ -983,17 +1103,32 @@ async def post_settings(new_settings: Dict[str, Any]):
         settings.POLYMARKET_UP_LABEL = p.get("up_label", settings.POLYMARKET_UP_LABEL)
         settings.POLYMARKET_DOWN_LABEL = p.get("down_label", settings.POLYMARKET_DOWN_LABEL)
 
-    if "live" in new_settings:
-        lv = new_settings["live"]
-        settings.CLOB_SIGNATURE_TYPE = int(lv.get("signature_type", settings.CLOB_SIGNATURE_TYPE))
-        settings.CLOB_FUNDER = lv.get("funder", settings.CLOB_FUNDER)
+    if "relayer" in new_settings and isinstance(new_settings["relayer"], dict):
+        if "api_key" in new_settings["relayer"]:
+            settings.RELAYER_API_KEY = new_settings["relayer"]["api_key"]
 
-    # Credentials/signature may have changed — drop the cached CLOB client so the
-    # next live order re-initialises with the new key/signature/funder.
+    if "chainlink" in new_settings and isinstance(new_settings["chainlink"], dict):
+        if "alchemy_api_key" in new_settings["chainlink"]:
+            settings.ALCHEMY_API_KEY = new_settings["chainlink"]["alchemy_api_key"]
+
+    if "capital_extractor" in new_settings:
+        ce = new_settings["capital_extractor"]
+        if "enabled" in ce: settings.AUTO_WITHDRAW_ENABLED = bool(ce["enabled"])
+        if "trigger_balance" in ce: settings.WITHDRAW_TRIGGER_BALANCE = float(ce["trigger_balance"])
+        if "withdraw_amount" in ce: settings.WITHDRAW_AMOUNT = float(ce["withdraw_amount"])
+        if "withdraw_address" in ce: settings.WITHDRAW_ADDRESS = ce["withdraw_address"]
+        if "auto_resume_after_withdrawal" in ce: settings.WITHDRAW_AUTO_RESUME = bool(ce["auto_resume_after_withdrawal"])
+        if "resume_after" in ce: settings.WITHDRAW_RESUME_AFTER = ce["resume_after"]
+
+    # Credentials may have changed — drop the cached CLOB client so the next live
+    # order re-initialises with the new key / relayer / alchemy settings.
     clob_trader.reset()
 
     state["trading_mode"] = settings.MODE
-    state["paper_balance"] = settings.PAPER_BALANCE_USD
+    # Only reset the displayed balance in paper mode; live mode reads the on-chain
+    # pUSD balance and we don't want to clobber it with the paper default on save.
+    if settings.MODE == "paper":
+        state["paper_balance"] = settings.PAPER_BALANCE_USD
 
     if settings.SYMBOL != old_symbol:
         binance_stream.close()
@@ -1023,28 +1158,46 @@ async def post_settings(new_settings: Dict[str, Any]):
 
     return {"status": "ok"}
 
-@app.post("/api/setup-allowances")
-async def setup_allowances():
-    import bot.allowances as allowances
-    try:
-        result = await allowances.ensure_allowances()
-        if result.get("ok"):
-            if result.get("skipped"):
-                log_message(f"Allowance setup skipped: {result.get('reason')}")
-            elif result.get("already_set"):
-                log_message("Allowances already configured for trading wallet")
-            else:
-                log_message(f"Allowances configured ({len(result.get('actions', []))} tx)")
-        else:
-            log_message(f"Allowance setup failed: {result.get('error')}")
-        return result
-    except Exception as e:
-        log_message(f"Allowance setup error: {e}")
-        return {"ok": False, "error": str(e)}
+def _reflect_running_now():
+    """Mirror the running flag into latest_data immediately so /api/latest is in sync
+    on the very next poll (the update loop would otherwise lag ~1s, flickering the UI)."""
+    ts = state["latest_data"].get("trading_state")
+    if isinstance(ts, dict):
+        ts["running"] = state["running"]
+
+@app.post("/api/start")
+async def start_trading():
+    """Begin trading. Data/prices stream continuously; this flips the gate so the
+    engine may enter/flip trades."""
+    state["running"] = True
+    _reflect_running_now()
+    log_message("Trading STARTED by user")
+    return {"ok": True, "running": True}
+
+@app.post("/api/stop")
+async def stop_trading():
+    """Stop all trading. New entries and flips halt immediately; any open position
+    keeps settling to expiry so it can't get stuck."""
+    state["running"] = False
+    _reflect_running_now()
+    log_message("Trading STOPPED by user")
+    return {"ok": True, "running": False}
+
+@app.post("/api/test-connection")
+async def test_connection():
+    """Validate the saved key/seed + relayer: derive the EOA and candidate wallets and
+    report which one holds pUSD (the trading wallet) and the chosen signature type."""
+    result = await asyncio.to_thread(clob_trader.test_connection)
+    if result.get("ok"):
+        log_message(f"Connection test OK: EOA {result.get('eoa')} → trading wallet {result.get('funder')}"
+                    + ("" if result.get("relayer_key_set") else "  (relayer key MISSING)"))
+    else:
+        log_message(f"Connection test failed: {result.get('error')}")
+    return result
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "last_update": state["last_update_ts"], "mode": state["trading_mode"]}
+    return {"status": "ok", "last_update": state["last_update_ts"], "mode": state["trading_mode"], "running": state["running"]}
 
 @app.get("/history")
 async def get_history():

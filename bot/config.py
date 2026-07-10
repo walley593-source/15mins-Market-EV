@@ -8,19 +8,23 @@ class Settings(BaseSettings):
 
     MODE: str = "paper"  # "paper" or "live"
     PAPER_BALANCE_USD: float = 1000.0
-    PRIVATE_KEY: str = ""
+    PRIVATE_KEY: str = ""  # hex private key, or derived from a 12/24-word seed phrase
 
-    # Live trading (Polymarket CLOB)
-    CLOB_SIGNATURE_TYPE: int = 0   # 0 = EOA, 1 = Email/Magic proxy, 2 = Browser proxy
-    CLOB_FUNDER: str = ""          # proxy wallet address (required for signature_type 1/2)
+    # Live trading (Polymarket CLOB V2). The wallet is derived from PRIVATE_KEY (hex
+    # key or seed phrase). New wallets trade via the gasless deposit-wallet flow
+    # (POLY_1271); the relayer key sponsors on-chain setup (deploy/approvals).
     CLOB_MAX_SLIPPAGE: float = 0.02  # marketable-limit buffer above the quote (probability units)
+    RELAYER_API_KEY: str = ""        # Polymarket relayer API key (gasless on-chain txs)
 
-    # Polymarket on-chain contracts (Polygon) — used for EOA allowance setup
-    USDC_ADDRESS: str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-    CTF_ADDRESS: str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-    CLOB_EXCHANGE_ADDRESS: str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
-    CLOB_NEG_RISK_EXCHANGE_ADDRESS: str = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
-    CLOB_NEG_RISK_ADAPTER_ADDRESS: str = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
+    # ── Auto-withdrawal (capital extractor) ─────────────────────────────────────
+    # When the live balance reaches TRIGGER, pause entries, wait until flat, then
+    # withdraw AMOUNT of pUSD to WITHDRAW_ADDRESS (gasless) and auto-resume trading.
+    AUTO_WITHDRAW_ENABLED: bool = False
+    WITHDRAW_TRIGGER_BALANCE: float = 2000.0  # withdraw once balance reaches this
+    WITHDRAW_AMOUNT: float = 1000.0           # amount of pUSD to withdraw each time
+    WITHDRAW_ADDRESS: str = ""                # destination wallet (required to withdraw)
+    WITHDRAW_AUTO_RESUME: bool = True         # resume trading after the withdrawal
+    WITHDRAW_RESUME_AFTER: str = "submitted"  # "submitted" or "confirmed"
 
     SYMBOL: str = "BTCUSDT"
     BINANCE_BASE_URL: str = "https://api.binance.com"
@@ -37,8 +41,9 @@ class Settings(BaseSettings):
     # ── Latency-arb entry engine ────────────────────────────────────────────────
     # Fair probability (fast, from Binance spot) vs Polymarket's implied price.
     # Enter when EV = fair - ask_price clears EV_THRESHOLD (the book looks stale).
-    EV_THRESHOLD: float = 0.04          # require >= this expected value per $1 share (after price)
+    EV_THRESHOLD: float = 0.06          # require >= this expected value per $1 share (after price)
     MIN_PROB_EV: float = 0.55           # don't bet near-coinflips even if EV looks positive
+    MAX_ENTRY_PRICE: float = 0.49       # value cap: never pay more than this for the chosen side
     MIN_BOOK_LIQUIDITY_USD: float = 20.0  # skip if the ask side can't absorb the stake
 
     # Close-and-flip the open position on a strong opposite signal
@@ -62,6 +67,9 @@ class Settings(BaseSettings):
     POLYGON_WSS_URLS: List[str] = [url.strip() for url in os.getenv("POLYGON_WSS_URLS", "").split(",") if url.strip()]
     CHAINLINK_BTC_USD_AGGREGATOR: str = os.getenv("CHAINLINK_BTC_USD_AGGREGATOR", "0xc907E116054Ad103354f2D350FD2514433D57F6f")
 
+    # Alchemy — Polygon RPC used for the on-chain live-trading path (reads/setup).
+    ALCHEMY_API_KEY: str = os.getenv("ALCHEMY_API_KEY", "")
+
     CHAINLINK_AGGREGATORS: Dict[str, str] = {
         "BTC": "0xc907E116054Ad103354f2D350FD2514433D57F6f",
         "ETH": "0xF9680D99D6C9589e2a93a78A04A279e509205945",
@@ -76,10 +84,29 @@ class Settings(BaseSettings):
         if s.endswith("USDT"): s = s[:-4]
         return self.CHAINLINK_AGGREGATORS.get(s, self.CHAINLINK_BTC_USD_AGGREGATOR)
 
+    def alchemy_rpc_url(self) -> str:
+        # Polygon RPC used by the live-trading (gasless) path when a key is set.
+        return f"https://polygon-mainnet.g.alchemy.com/v2/{self.ALCHEMY_API_KEY}" if self.ALCHEMY_API_KEY else ""
+
     # Proxy
     HTTP_PROXY: str = os.getenv("HTTP_PROXY", os.getenv("http_proxy", ""))
     HTTPS_PROXY: str = os.getenv("HTTPS_PROXY", os.getenv("https_proxy", ""))
     ALL_PROXY: str = os.getenv("ALL_PROXY", os.getenv("all_proxy", ""))
+
+def normalize_private_key(secret: str) -> str:
+    """Accept either a raw hex private key or a 12/24-word seed phrase and return a
+    hex private key. EOA only — the wallet is derived from the secret, nothing else.
+    Returns "" for empty input. Raises if a seed phrase can't be parsed."""
+    secret = (secret or "").strip()
+    if not secret:
+        return ""
+    # A mnemonic is several space-separated words; a private key is a single token.
+    if len(secret.split()) >= 12:
+        from eth_account import Account
+        Account.enable_unaudited_hdwallet_features()
+        return Account.from_mnemonic(secret).key.hex()
+    return secret
+
 
 def load_settings():
     base_settings = Settings()
@@ -91,12 +118,20 @@ def load_settings():
 
             if "mode" in config_data: base_settings.MODE = config_data["mode"]
             if "paper_balance_usd" in config_data: base_settings.PAPER_BALANCE_USD = config_data["paper_balance_usd"]
-            if "private_key" in config_data: base_settings.PRIVATE_KEY = config_data["private_key"]
+            if "private_key" in config_data: base_settings.PRIVATE_KEY = normalize_private_key(config_data["private_key"])
 
-            if "live" in config_data:
-                live = config_data["live"]
-                if "signature_type" in live: base_settings.CLOB_SIGNATURE_TYPE = int(live["signature_type"])
-                if "funder" in live: base_settings.CLOB_FUNDER = live["funder"]
+            if "relayer" in config_data:
+                rl = config_data["relayer"]
+                if "api_key" in rl: base_settings.RELAYER_API_KEY = rl["api_key"]
+
+            if "capital_extractor" in config_data:
+                ce = config_data["capital_extractor"]
+                if "enabled" in ce: base_settings.AUTO_WITHDRAW_ENABLED = bool(ce["enabled"])
+                if "trigger_balance" in ce: base_settings.WITHDRAW_TRIGGER_BALANCE = float(ce["trigger_balance"])
+                if "withdraw_amount" in ce: base_settings.WITHDRAW_AMOUNT = float(ce["withdraw_amount"])
+                if "withdraw_address" in ce: base_settings.WITHDRAW_ADDRESS = ce["withdraw_address"]
+                if "auto_resume_after_withdrawal" in ce: base_settings.WITHDRAW_AUTO_RESUME = bool(ce["auto_resume_after_withdrawal"])
+                if "resume_after" in ce: base_settings.WITHDRAW_RESUME_AFTER = ce["resume_after"]
 
             if "polymarket" in config_data:
                 poly = config_data["polymarket"]
@@ -122,6 +157,7 @@ def load_settings():
                 ev = config_data["ev"]
                 if "ev_threshold" in ev: base_settings.EV_THRESHOLD = float(ev["ev_threshold"])
                 if "min_prob" in ev: base_settings.MIN_PROB_EV = float(ev["min_prob"])
+                if "max_entry_price" in ev: base_settings.MAX_ENTRY_PRICE = float(ev["max_entry_price"])
                 if "min_book_liquidity_usd" in ev: base_settings.MIN_BOOK_LIQUIDITY_USD = float(ev["min_book_liquidity_usd"])
 
             if "flip" in config_data:
@@ -135,6 +171,7 @@ def load_settings():
                 if "polygon_rpc_url" in cl: base_settings.POLYGON_RPC_URL = cl["polygon_rpc_url"]
                 if "polygon_wss_url" in cl: base_settings.POLYGON_WSS_URL = cl["polygon_wss_url"]
                 if "btc_usd_aggregator" in cl: base_settings.CHAINLINK_BTC_USD_AGGREGATOR = cl["btc_usd_aggregator"]
+                if "alchemy_api_key" in cl: base_settings.ALCHEMY_API_KEY = cl["alchemy_api_key"]
 
         except Exception as e:
             print(f"Warning: Failed to load config.json: {e}")
